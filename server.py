@@ -4,12 +4,13 @@
 
 Локальное веб-приложение: запускается двойным кликом по файлу
 «Запустить Whisper.command», открывает окно в браузере и работает
-полностью офлайн (модель mlx-whisper уже скачана в кеш).
+полностью офлайн (модель распознавания уже скачана в кеш).
 
 Рассчитано на слабые машины (8 ГБ RAM): аудио обрабатывается кусками,
 куски удаляются сразу, память не растёт, зависшая задача не блокирует очередь.
 
-Зависимости: mlx-whisper и ffmpeg из уже установленного окружения.
+Распознавание работает на одном из двух бэкендов: mlx-whisper (Apple Silicon)
+или faster-whisper (процессор, любая система). Нужен ещё ffmpeg.
 Используется только стандартная библиотека Python.
 """
 from __future__ import annotations
@@ -34,12 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue
 from urllib.parse import parse_qs, unquote, urlparse
 
-try:
-    import fcntl  # только macOS/Linux — защита от двойного запуска
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
-
-# Служебные полосы прогресса tqdm от mlx_whisper глушим через подмену stderr
+# Служебные полосы прогресса tqdm глушим через подмену stderr
 # (переменная TQDM_DISABLE на практике не помогает).
 os.environ.setdefault("TQDM_DISABLE", "1")
 
@@ -49,6 +45,49 @@ if os.environ.get("WHISPER_ALLOW_NET") != "1":
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# --------------------------------------------------------------------------
+# Бэкенд распознавания
+#   mlx     — MLX, только Apple Silicon (быстро, видеокарта)
+#   faster  — faster-whisper (CTranslate2), работает на CPU везде:
+#             Windows, Linux, Intel-маки
+# Выбор: WHISPER_BACKEND=mlx|faster, иначе автоматически.
+# --------------------------------------------------------------------------
+try:
+    import mlx_whisper as _mlx_module
+except Exception:  # pragma: no cover — на не-Apple платформах
+    _mlx_module = None
+
+try:
+    import faster_whisper as _faster_module
+except Exception:  # pragma: no cover — если не установлен
+    _faster_module = None
+
+mlx_whisper = _mlx_module
+faster_whisper = _faster_module
+
+
+def _pick_backend() -> str:
+    want = (os.environ.get("WHISPER_BACKEND") or "").strip().lower()
+    if want == "mlx":
+        return "mlx" if mlx_whisper else ""
+    if want == "faster":
+        return "faster" if faster_whisper else ""
+    if mlx_whisper is not None:
+        return "mlx"          # на Apple Silicon он быстрее
+    if faster_whisper is not None:
+        return "faster"
+    return ""
+
+
+BACKEND = _pick_backend()
+BACKEND_LABEL = {
+    "mlx": "MLX (Apple Silicon)",
+    "faster": "faster-whisper (CPU)",
+}.get(BACKEND, "не найден")
+IMPORT_ERROR = None if BACKEND else (
+    "не установлен ни mlx-whisper, ни faster-whisper — "
+    "запустите setup.sh (macOS) или setup.ps1 (Windows)")
 
 # --------------------------------------------------------------------------
 # Настройки и пути
@@ -62,9 +101,7 @@ UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 WORK_DIR = os.path.join(DATA_DIR, "work")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
-LOCK_FILE = os.path.join(DATA_DIR, "app.lock")
 PORT_FILE = os.path.join(DATA_DIR, "port.txt")
-_LOCK_HANDLE = None  # держим открытым, чтобы блокировка жила, пока работает процесс
 
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 RENAMES_FILE = os.path.join(DATA_DIR, "renames.json")
@@ -91,9 +128,10 @@ def save_settings(data: dict) -> None:
         pass
 
 
-# Модели в каталоге проверены: mlx-whisper умеет читать только weights.npz
-# или weights.safetensors, поэтому репозитории с model.safetensors не подходят.
-MODEL_CATALOG = [
+# Каталоги моделей для двух бэкендов.
+# MLX читает только weights.npz / weights.safetensors, поэтому репозитории
+# с model.safetensors ему не подходят. faster-whisper работает с CTranslate2.
+MODEL_CATALOG_MLX = [
     {
         "id": "mlx-community/whisper-large-v3-turbo-q4",
         "label": "Large v3 turbo, сжатая (4 бита)",
@@ -114,10 +152,38 @@ MODEL_CATALOG = [
     },
 ]
 
+MODEL_CATALOG_FASTER = [
+    {
+        "id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+        "label": "Large v3 turbo (процессор)",
+        "size_mb": 1543,
+        "note": "Лучшее качество на процессоре. Скорость зависит от машины",
+    },
+    {
+        "id": "Systran/faster-whisper-small",
+        "label": "Small (процессор)",
+        "size_mb": 461,
+        "note": "Быстрее, но хуже распознаёт имена и термины",
+    },
+    {
+        "id": "Systran/faster-whisper-base",
+        "label": "Base (процессор)",
+        "size_mb": 145,
+        "note": "Самая лёгкая, качество на русском невысокое",
+    },
+]
+
+MODEL_CATALOG = MODEL_CATALOG_MLX if BACKEND == "mlx" else MODEL_CATALOG_FASTER
+DEFAULT_MODEL = MODEL_CATALOG[0]["id"] if MODEL_CATALOG else ""
+
 _settings = load_settings()
 MODEL = (os.environ.get("WHISPER_MODEL")
          or _settings.get("model")
-         or "mlx-community/whisper-large-v3-turbo-q4")
+         or DEFAULT_MODEL)
+# если сохранена модель от другого бэкенда (например, MLX при faster-whisper),
+# берём модель по умолчанию для текущего бэкенда
+if MODEL_CATALOG and not any(m["id"] == MODEL for m in MODEL_CATALOG):
+    MODEL = DEFAULT_MODEL
 LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru")
 
 
@@ -168,15 +234,6 @@ RUNNING_STATES = ("queued", "probe", "extract", "transcribe", "save")
 for _d in (DATA_DIR, UPLOAD_DIR, WORK_DIR, OUTPUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
-try:
-    import mlx_whisper
-
-    IMPORT_ERROR = None
-except Exception as _e:  # pragma: no cover
-    mlx_whisper = None
-    IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
-
-
 # --------------------------------------------------------------------------
 # Ресурсы машины
 # --------------------------------------------------------------------------
@@ -186,6 +243,8 @@ def available_memory_bytes() -> int | None:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
     except (ValueError, OSError, AttributeError):
         pass
+    if sys.platform.startswith("win"):
+        return _windows_memory()[1]
     if sys.platform == "darwin":
         # на macOS SC_AVPHYS_PAGES нет — считаем по vm_stat
         try:
@@ -206,11 +265,41 @@ def available_memory_bytes() -> int | None:
     return None
 
 
+def _windows_memory() -> tuple[int | None, int | None]:
+    """(всего, свободно) в байтах для Windows — там os.sysconf нет."""
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = _MemoryStatusEx()
+        st.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullTotalPhys), int(st.ullAvailPhys)
+    except Exception:
+        pass
+    return None, None
+
+
 def total_memory_bytes() -> int | None:
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError, AttributeError):
-        return None
+        pass
+    if sys.platform.startswith("win"):
+        return _windows_memory()[0]
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -703,7 +792,7 @@ def catalog_entry(model_id: str) -> dict | None:
 
 def set_current_model(model_id: str) -> None:
     """Переключает модель на лету и запоминает выбор."""
-    global MODEL
+    global MODEL, _faster_model, _faster_model_id
     MODEL = model_id
     s = load_settings()
     s["model"] = model_id
@@ -716,6 +805,9 @@ def set_current_model(model_id: str) -> None:
         ModelHolder.model_path = None
     except Exception:
         pass
+    with _model_lock:
+        _faster_model = None
+        _faster_model_id = None
 
 
 DOWNLOADS: dict[str, dict] = {}
@@ -1200,14 +1292,33 @@ def human_error(exc: BaseException, extra: str = "") -> str:
         return ("Модель распознавания не найдена в кеше, а интернет отключён. "
                 "Подключите интернет и запустите с WHISPER_ALLOW_NET=1.")
     if IMPORT_ERROR:
-        return ("Не удалось загрузить mlx-whisper. Запустите приложение через "
-                "../_venv/bin/python (файл «Запустить Whisper.command»).")
+        return ("Не удалось загрузить библиотеку распознавания. Запустите "
+                "setup.sh (macOS) или setup.ps1 (Windows), затем приложение "
+                "через «Запустить Whisper.command».")
     if "ffmpeg" in msg:
         return "ffmpeg не смог прочитать этот файл — возможно, он повреждён."
     return "Не удалось обработать файл."
 
 
-def transcribe_chunk(chunk_path: str, prompt: str) -> tuple[list[dict], str]:
+_faster_model = None
+_faster_model_id = None
+_model_lock = threading.Lock()
+
+
+def _get_faster_model(model_id: str):
+    """Загружает и кэширует модель faster-whisper (CTranslate2, процессор)."""
+    global _faster_model, _faster_model_id
+    with _model_lock:
+        if _faster_model is None or _faster_model_id != model_id:
+            device = os.environ.get("WHISPER_DEVICE", "cpu")
+            compute = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+            _faster_model = faster_whisper.WhisperModel(
+                model_id, device=device, compute_type=compute)
+            _faster_model_id = model_id
+        return _faster_model
+
+
+def _transcribe_mlx(chunk_path: str, prompt: str) -> list[dict]:
     kwargs = dict(
         path_or_hf_repo=MODEL,
         language=LANGUAGE,
@@ -1217,15 +1328,53 @@ def transcribe_chunk(chunk_path: str, prompt: str) -> tuple[list[dict], str]:
         word_timestamps=False,
         temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
     )
-    prompt = (prompt or "").strip()[:MAX_PROMPT_CHARS]
     if prompt:
         kwargs["initial_prompt"] = prompt
+    res = mlx_whisper.transcribe(chunk_path, **kwargs)
+    return list(res.get("segments") or [])
+
+
+def _transcribe_faster(chunk_path: str, prompt: str) -> list[dict]:
+    model = _get_faster_model(MODEL)
+    segments, _info = model.transcribe(
+        chunk_path,
+        language=LANGUAGE,
+        task="transcribe",
+        beam_size=_int_env("WHISPER_BEAM", 5, 1),
+        condition_on_previous_text=False,
+        initial_prompt=prompt or None,
+        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        vad_filter=False,      # тишину отсекаем сами, через Silero VAD
+        word_timestamps=False,
+    )
+    out: list[dict] = []
+    for s in segments:         # это генератор — читаем его здесь же
+        out.append({
+            "start": float(getattr(s, "start", 0.0) or 0.0),
+            "end": float(getattr(s, "end", 0.0) or 0.0),
+            "text": (getattr(s, "text", "") or "").strip(),
+            "avg_logprob": getattr(s, "avg_logprob", None),
+            "compression_ratio": getattr(s, "compression_ratio", None),
+        })
+    return out
+
+
+def transcribe_chunk(chunk_path: str, prompt: str) -> tuple[list[dict], str]:
+    """Распознаёт кусок и возвращает сегменты в общем формате.
+
+    Внутри — выбранный бэкенд: MLX (Apple Silicon) или faster-whisper (CPU).
+    """
+    prompt = (prompt or "").strip()[:MAX_PROMPT_CHARS]
     with _quiet_stderr() as buf:
         try:
-            res = mlx_whisper.transcribe(chunk_path, **kwargs)
+            if BACKEND == "faster":
+                segs = _transcribe_faster(chunk_path, prompt)
+            else:
+                segs = _transcribe_mlx(chunk_path, prompt)
         except BaseException:
-            raise RuntimeError((buf.getvalue() or "").strip()[-400:] or "сбой распознавания")
-    return list(res.get("segments") or []), buf.getvalue() or ""
+            raise RuntimeError((buf.getvalue() or "").strip()[-400:]
+                               or "сбой распознавания")
+    return segs, buf.getvalue() or ""
 
 
 _vad_lock = threading.Lock()
@@ -1470,7 +1619,7 @@ def process_job(job: dict) -> None:
         progress=1)
 
     if IMPORT_ERROR:
-        raise RuntimeError("mlx_whisper недоступен: " + IMPORT_ERROR)
+        raise RuntimeError("Бэкенд распознавания недоступен: " + IMPORT_ERROR)
 
     tracks = audio_track_indices(src)
     if not tracks:
@@ -1727,6 +1876,8 @@ class Handler(BaseHTTPRequestHandler):
                 "app": APP_NAME,
                 "version": VERSION,
                 "model": MODEL,
+                "backend": BACKEND,
+                "backend_label": BACKEND_LABEL,
                 "language": LANGUAGE,
                 "chunk": CHUNK_SECONDS,
                 "overlap": CHUNK_OVERLAP,
@@ -2050,16 +2201,28 @@ class QuietServer(ThreadingHTTPServer):
 # --------------------------------------------------------------------------
 # Запуск
 # --------------------------------------------------------------------------
+INSTANCE_PORT = _int_env("WHISPER_INSTANCE_PORT", 47821, 1024)
+_instance_socket = None
+
+
 def acquire_single_instance() -> bool:
-    global _LOCK_HANDLE
-    if fcntl is None:
-        return True
+    """Не даёт запустить второй экземпляр приложения.
+
+    Работает одинаково на macOS, Windows и Linux: занимаем локальный порт.
+    Пока процесс жив, порт занят — повторный запуск это увидит.
+    """
+    global _instance_socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        f = open(LOCK_FILE, "a+")
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        s.bind(("127.0.0.1", INSTANCE_PORT))
+        s.listen(1)
     except OSError:
+        try:
+            s.close()
+        except OSError:
+            pass
         return False
-    _LOCK_HANDLE = f
+    _instance_socket = s
     return True
 
 
@@ -2098,6 +2261,7 @@ def main() -> None:
     print("=" * 68)
     print(f"  {APP_NAME}  v{VERSION}")
     print("=" * 68)
+    print(f"  Бэкенд   : {BACKEND_LABEL}")
     print(f"  Модель   : {MODEL}")
     print(f"  Язык     : {LANGUAGE}")
     print(f"  Фрагмент : {CHUNK_SECONDS} с (перекрытие {CHUNK_OVERLAP} с)")
@@ -2112,12 +2276,13 @@ def main() -> None:
         if free < 2 * 1024 ** 3:
             print("  ВНИМАНИЕ: мало свободной памяти. Закройте лишние программы.")
     if IMPORT_ERROR:
-        print("\n  ВНИМАНИЕ: mlx_whisper недоступен —", IMPORT_ERROR)
+        print("\n  ВНИМАНИЕ:", IMPORT_ERROR)
         print("  Убедитесь, что запускаете через ../_venv/bin/python")
 
     # если выбранной модели нет в кеше — переключаемся на модель по умолчанию
+    # (для текущего бэкенда: MLX и faster-whisper используют разные модели)
     if not model_installed(MODEL):
-        fallback = "mlx-community/whisper-large-v3-turbo-q4"
+        fallback = DEFAULT_MODEL
         if MODEL != fallback and model_installed(fallback):
             print(f"\n  Модель {MODEL} не найдена в кеше — беру {fallback}")
             set_current_model(fallback)

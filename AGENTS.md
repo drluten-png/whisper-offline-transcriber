@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Файл для ИИ-агентов и разработчиков. Коротко: что это за проект, что **нельзя
-ломать**, как запускать и что именно нужно заменить, чтобы работало на Windows.
+ломать**, как запускать на macOS и на Windows.
 
 ## Что это
 
@@ -9,8 +9,15 @@
 поднимает HTTP-сервер на `127.0.0.1`, раздаёт веб-интерфейс и обрабатывает очередь
 задач: `ffmpeg` вырезает звук → определение речи (VAD) → распознавание → запись `.txt`.
 
-Сейчас распознавание работает на **MLX** (Apple Silicon). Всё остальное —
-кроссплатформенное.
+Распознавание работает на одном из двух бэкендов, остальной код общий:
+
+| Бэкенд | Где работает | Что использует |
+|---|---|---|
+| `mlx` | только Apple Silicon | mlx-whisper, считает на видеокарте |
+| `faster` | Windows, Linux, Intel-маки | faster-whisper (CTranslate2), считает на процессоре |
+
+Бэкенд выбирается автоматически (нет MLX → берётся faster-whisper) либо явно:
+`WHISPER_BACKEND=mlx|faster`.
 
 ## Жёсткие правила
 
@@ -20,20 +27,25 @@
    Не меняйте это без явного запроса — приложение без пароля.
 3. **Конфиденциальность.** Записи и расшифровки не должны попадать в репозиторий.
    Папки `data/` и `output/` уже в `.gitignore` — не убирайте их оттуда.
-4. **Модели в репозиторий не коммитить.** `setup.sh` скачивает их отдельно.
+4. **Модели в репозиторий не коммитить.** Их скачивают `setup.sh` (macOS) и `setup.ps1` (Windows).
+5. **Один формат сегментов на оба бэкенда** (см. «Контракты»). Новый бэкенд обязан
+   отдавать те же поля — иначе поедут фильтры, склейка и запись.
 
 ## Карта кода (server.py)
 
 | Что | Где искать |
 |---|---|
 | Настройки и переменные окружения | начало файла, `_int_env` / `_float_env` |
+| Выбор бэкенда | `_pick_backend`, `BACKEND`, каталоги `MODEL_CATALOG_MLX` / `MODEL_CATALOG_FASTER` |
 | Извлечение звука из файла | `_run_ffmpeg_extract`, `extract_chunk`, `audio_track_indices` |
 | Определение речи (Silero VAD) | `vad_probs`, `speech_intervals`, `chunk_has_speech`, `snap_to_silence` |
 | Границы кусков по паузам | `find_chunk_boundaries` |
-| Распознавание | `transcribe_chunk` ← **единственное место, привязанное к MLX** |
+| Распознавание | `transcribe_chunk` → `_transcribe_mlx` / `_transcribe_faster` |
 | Чистка текста | `is_hallucination`, `dedup_segments`, `apply_glossary` |
 | Запись результата | `write_txt` (пишет через `.part` и `os.replace`) |
 | Очередь и надёжность | `worker`, `watchdog`, `_run_job_safe`, `persist_jobs` |
+| Ресурсы машины | `available_memory_bytes`, `total_memory_bytes`, `_windows_memory` |
+| Один экземпляр | `acquire_single_instance` (занимает локальный порт) |
 | HTTP | класс `Handler` (эндпоинты `/api/...`) |
 
 ## Контракты, которые нельзя менять
@@ -47,7 +59,8 @@
 ```
 
 `start`/`end` — секунды **от начала всего файла** (смещение куска прибавляется при
-склейке). `avg_logprob` и `compression_ratio` нужны фильтру галлюцинаций.
+склейке). `avg_logprob` и `compression_ratio` нужны фильтру галлюцинаций; если бэкенд
+их не даёт — верните `None`.
 
 **Файлы в `data/`** (формат важен для совместимости): `glossary.json`, `jobs.json`,
 `settings.json`, `renames.json`, `port.txt`, `backup/`.
@@ -57,97 +70,62 @@
 `/api/models/select`, `/api/models/download`, `/api/open-output`. Интерфейс в
 `app.js` зависит от их полей — при изменениях правьте обе стороны.
 
-## Запуск на macOS (текущая версия)
+## Запуск на macOS (Apple Silicon)
 
 ```bash
 brew install ffmpeg
-bash setup.sh          # создаст .venv, поставит mlx-whisper и onnxruntime, скачает модель
+bash setup.sh          # .venv, mlx-whisper + onnxruntime, скачивание модели
 ./"Запустить Whisper.command"
 ```
 
+Бэкенд выбирается сам — MLX. Переключать его на macOS не нужно.
+
 ## Запуск на Windows
 
-### Почему «просто запустить» не получится
+Приложение работает на процессоре, видеокарта не требуется (бэкенд `faster-whisper`).
 
-1. **MLX существует только для Apple Silicon.** На Windows пакет `mlx-whisper`
-   не устанавливается, поэтому импорт на строке `import mlx_whisper` падает —
-   сервер поднимется, но каждая задача завершится ошибкой.
-2. **Лаунчер `Запустить Whisper.command` — это shell-скрипт** macOS; Windows его не выполнит.
-3. **Защита от двойного запуска** использует `fcntl` (только macOS/Linux).
-4. **`os.sysconf`** (показатель свободной памяти) в Windows отсутствует — вернётся `None`,
-   индикатор памяти просто скроется. Не критично, но лучше заменить.
+**1. Поставить Python и ffmpeg** (один раз):
 
-Всё остальное — `ffmpeg`, `onnxruntime` + `models/silero_vad.onnx`, `wave`, `numpy`,
-HTTP-сервер, интерфейс, словарь, журнал задач — работает на Windows без изменений.
-
-### Что заменить (по шагам)
-
-**1. Бэкенд распознавания.** Поставить `faster-whisper` (CTranslate2, работает на CPU):
-
-```bash
-pip install faster-whisper
+```powershell
+winget install Python.Python.3.12
+winget install Gyan.FFmpeg
 ```
 
-В `server.py` заменить импорт (`import mlx_whisper`) и тело `transcribe_chunk`:
+**2. Подготовить окружение** — в папке приложения, один раз:
 
-```python
-from faster_whisper import WhisperModel
-
-def _load_model(model_id: str):
-    return WhisperModel(model_id, device="cpu", compute_type="int8")
-
-# внутри transcribe_chunk:
-segments, info = model.transcribe(
-    chunk_path, language=LANGUAGE, task="transcribe",
-    condition_on_previous_text=False,
-    initial_prompt=prompt or None,
-    temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-    vad_filter=False,           # VAD у нас свой, см. ниже
-    beam_size=5,
-)
-out = [{"start": s.start, "end": s.end, "text": (s.text or "").strip(),
-        "avg_logprob": getattr(s, "avg_logprob", None),
-        "compression_ratio": getattr(s, "compression_ratio", None)}
-       for s in segments]         # segments — генератор, нужен list()
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-Проверить, что `faster_whisper.Segment` отдаёт `avg_logprob` и `compression_ratio`;
-если нет — подставить `None` (фильтр галлюцинаций продолжит работать по фразам).
+Скрипт создаст `.venv`, поставит `faster-whisper` и `onnxruntime`, скачает модель
+распознавания (~1.5 ГБ). Дальше интернет не нужен.
 
-**2. Каталог моделей.** В `MODEL_CATALOG` заменить идентификаторы MLX на модели
-CTranslate2 (например `deepdml/faster-whisper-large-v3-turbo-ct2`), а `MODEL` по
-умолчанию — на нужную. Функция `model_installed()` проверяет кеш HuggingFace и
-работает с любым репозиторием, менять её не нужно.
+**3. Запускать** двойным кликом по **`start.bat`** — откроется окно консоли
+(не закрывайте его) и браузер.
 
-**3. Сброс модели при переключении.** `set_current_model()` чистит
-`mlx_whisper.transcribe.ModelHolder` — заменить на сброс своего кешированного
-объекта `WhisperModel`, иначе при смене модели останется старая.
+Что уже сделано для кроссплатформенности:
 
-**4. Лаунчер.** Добавить `start.bat` (имя латиницей — с кириллицей в `.bat` бывают
-проблемы с кодовой страницей):
+- **Бэкенды и каталоги моделей.** `_pick_backend` выбирает движок, каталоги раздельные:
+  MLX-модели и CTranslate2-модели. Сохранённая модель «чужого» бэкенда заменяется
+  моделью по умолчанию для текущего.
+- **Распознавание** изолировано: `transcribe_chunk` → `_transcribe_mlx` / `_transcribe_faster`.
+- **Один экземпляр** — занятие локального порта (`acquire_single_instance`), без `fcntl`.
+- **Память** — `GlobalMemoryStatusEx` через `ctypes` (Windows), `vm_stat` (macOS),
+  `sysconf` (Linux).
+- **Открытие папки** — `os.startfile` (Windows), `open` (macOS), `xdg-open` (Linux).
+- **Лончеры и установщики** — `start.bat`, `setup.ps1` рядом с macOS-версиями.
 
-```bat
-@echo off
-chcp 65001 >nul
-cd /d "%~dp0"
-set PYTHONUTF8=1
-set HF_HUB_OFFLINE=1
-if exist ".venv\Scripts\python.exe" (set PY=.venv\Scripts\python.exe) else (set PY=python)
-"%PY%" server.py
-```
+Что **не проверено на живой Windows** (портирование написано и протестировано на
+macOS с тем же кодом бэкенда `faster`):
 
-**5. Установщик.** Добавить `setup.ps1` по образцу `setup.sh`:
-проверка `python`, `python -m venv .venv`, `pip install faster-whisper onnxruntime`,
-скачивание модели, подсказка про `winget install Gyan.FFmpeg`.
+- сами `start.bat` и `setup.ps1`;
+- кириллица в консоли — в `start.bat` есть `chcp 65001` и `PYTHONUTF8=1`;
+- путь с русскими буквами — если что-то падает, положите папку в путь без кириллицы;
+- скорость на процессоре: если мало, выберите в интерфейсе модель поменьше
+  (`Systran/faster-whisper-small`). Точность `int8` регулируется
+  `WHISPER_COMPUTE_TYPE`, устройство — `WHISPER_DEVICE`.
 
-**6. Защита от двойного запуска.** `fcntl` заменить на кроссплатформенный приём:
-попытка занять локальный порт (`socket.bind`) — если занят, значит приложение уже
-запущено. Это заодно убирает гонку в `find_port`.
-
-**7. Показатель памяти.** Вместо `os.sysconf` использовать `ctypes` →
-`GlobalMemoryStatusEx`, либо `psutil.virtual_memory()`.
-
-### Чего НЕ нужно переписывать
+### Чего НЕ нужно переписывать (одинаково на всех системах)
 
 Извлечение звука и работа с дорожками, Silero VAD, границы кусков по паузам,
 склейка с перекрытием, дедупликация, фильтр галлюцинаций, словарь терминов,
@@ -155,10 +133,10 @@ if exist ".venv\Scripts\python.exe" (set PY=.venv\Scripts\python.exe) else (set 
 
 ## Как проверять
 
-1. **Без GPU и без модели.** Подменить бэкенд заглушкой: положить свой модуль
-   `mlx_whisper.py` рядом и запускать сервер с `PYTHONPATH`, где `transcribe()`
-   возвращает фиктивные сегменты. Так проверяется весь конвейер (нарезка, фильтры,
-   склейка, запись, API) за секунды:
+1. **Без модели и без видеокарты.** Подменить бэкенд заглушкой: положить свой модуль
+   `mlx_whisper.py` (или `faster_whisper.py`) рядом и запускать сервер с `PYTHONPATH`,
+   где `transcribe()` возвращает фиктивные сегменты. Так проверяется весь конвейер
+   (нарезка, фильтры, склейка, запись, API) за секунды:
 
    ```python
    # stub/mlx_whisper.py
@@ -171,8 +149,13 @@ if exist ".venv\Scripts\python.exe" (set PY=.venv\Scripts\python.exe) else (set 
    PYTHONPATH=stub WHISPER_NO_BROWSER=1 python server.py
    ```
 
-2. **Один короткий настоящий прогон** (5–15 секунд аудио) — что модель грузится,
-   сегменты пишутся, шапка файла корректна.
+2. **Настоящий прогон на 15 секундах** для каждого бэкенда — что модель грузится,
+   сегменты пишутся, шапка файла корректна:
+
+   ```bash
+   WHISPER_BACKEND=faster python -c "import server,sys; \
+     print(server.transcribe_chunk('clip15.wav','')[0][:2])"
+   ```
 
 3. **Проверка VAD.** Сделать файл «речь — 8 секунд тишины — речь» и убедиться, что
    пауза не уходит в распознавание, а граница куска попадает в тишину.
