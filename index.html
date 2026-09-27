@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whisper — офлайн-транскрибация</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">🎧</div>
+    <div>
+      <h1>Whisper</h1>
+      <p>Офлайн-транскрибация аудио и видео</p>
+    </div>
+  </div>
+  <div class="badges">
+    <span class="badge badge-ok">● Офлайн</span>
+    <span class="badge" id="badgeModel">модель…</span>
+    <span class="badge" id="badgeLang">язык…</span>
+    <span class="badge" id="badgeMem" hidden></span>
+  </div>
+</header>
+
+<main>
+  <div id="banner" class="banner" hidden></div>
+
+  <section class="drop" id="drop" role="button" tabindex="0"
+           aria-label="Выбрать аудио или видео файлы для транскрибации">
+    <input type="file" id="fileInput" multiple hidden>
+    <div class="drop-inner">
+      <div class="drop-icon">⬇︎</div>
+      <div class="drop-title">Перетащите сюда аудио или видео</div>
+      <div class="drop-sub">или нажмите, чтобы выбрать файлы</div>
+      <div class="drop-formats">mp3 · wav · m4a · flac · ogg · opus · mp4 · mov · mkv · webm · avi — формат определяется автоматически<br>Записи на час и дольше обрабатываются по частям, интернет не нужен</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-row">
+      <label class="check">
+        <input type="checkbox" id="timestamps" checked>
+        <span>Добавлять таймкоды в TXT</span>
+      </label>
+      <button class="btn btn-ghost" id="openOutput" type="button">Открыть папку результатов</button>
+    </div>
+    <label class="field">
+      <span>Подсказка для терминов и имён <em>(необязательно)</em></span>
+      <input type="text" id="prompt" maxlength="500"
+             placeholder="Например: фасилитатор, экспедиция, мастер-план, фамилии участников…">
+    </label>
+    <p class="hint">Подсказка повышает точность на названиях, именах и терминах конкретной встречи
+      (до 500 символов).</p>
+
+    <div class="model-row">
+      <label class="field grow">
+        <span>Модель распознавания</span>
+        <select id="modelSelect"></select>
+      </label>
+      <button class="btn" id="modelBtn" type="button" hidden>Скачать</button>
+    </div>
+    <p class="hint" id="modelHint"></p>
+
+    <details class="glossary">
+      <summary>Словарь терминов и имён <span id="glossaryCount" class="counter"></span></summary>
+      <p class="hint">Одна запись в строке. Просто слово — правильное написание (попадает в подсказку
+        распознаванию). Через стрелку — замена: «как слышится → как правильно», указывается
+        основа слова, поэтому «гигел → Гегел» поправит и «Гигелем», и «Гигеля».
+        Строки, начинающиеся с #, игнорируются.</p>
+      <textarea id="glossaryText" rows="12" spellcheck="false"></textarea>
+      <div class="panel-row">
+        <button class="btn" id="glossarySave" type="button">Сохранить словарь</button>
+        <span class="hint" id="glossaryHint"></span>
+      </div>
+    </details>
+  </section>
+
+  <section class="jobs">
+    <div class="jobs-head">
+      <h2>Очередь</h2>
+      <span class="counter" id="jobsCount"></span>
+    </div>
+    <div id="jobsList" class="jobs-list">
+      <div class="empty" id="emptyState">Пока пусто. Добавьте файл — транскрипция появится здесь.</div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span id="footInfo">Запуск…</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
